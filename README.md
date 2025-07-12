@@ -85,47 +85,124 @@ Salve o conteúdo abaixo em `/usr/local/bin/scrolllock_watchdog.py` (ajuste `DEV
 
 ```python
 #!/usr/bin/env python3
-import evdev
 import os
+import time
+import threading
+import evdev
+import pyudev
+from pathlib import Path
+from evdev import InputDevice, ecodes
 
-DEVICE_PATH = '/dev/input/event2'        # Ajuste conforme seu teclado
-DEVICE_NAME = 'input2::scrolllock'       # Nome do dispositivo no brightnessctl
-BRIGHTNESSCTL = '/usr/bin/brightnessctl' # Caminho do brightnessctl
+BRIGHTNESSCTL = '/usr/bin/brightnessctl'
+HEARTBEAT_INTERVAL = 5  # segundos
 
-def get_scrolllock_state():
+
+def find_scrolllock_led():
+    leds_path = Path("/sys/class/leds")
+    for led in leds_path.iterdir():
+        if "scrolllock" in led.name:
+            return led.name  # ex: input2::scrolllock
+    return None
+
+
+def get_scrolllock_state(device_name):
     try:
-        result = os.popen(f"{BRIGHTNESSCTL} --device='{DEVICE_NAME}' g").read().strip()
+        result = os.popen(f"{BRIGHTNESSCTL} --device='{device_name}' g").read().strip()
         return int(result)
-    except:
+    except Exception as e:
+        print(f"[Erro] Estado do Scroll Lock: {e}")
         return 0
 
-def turn_on_scroll_lock():
-    os.system(f"{BRIGHTNESSCTL} --device='{DEVICE_NAME}' set 1")
+
+def set_scrolllock(device_name, value):
+    os.system(f"{BRIGHTNESSCTL} --device='{device_name}' set {value}")
+
+
+def blink_led(device_name):
+    """Pisca o Scroll Lock como heartbeat."""
+    while True:
+        set_scrolllock(device_name, 0)
+        time.sleep(0.2)
+        set_scrolllock(device_name, 1)
+        time.sleep(HEARTBEAT_INTERVAL)
+
+
+def find_keyboard_device():
+    for path in evdev.list_devices():
+        try:
+            device = InputDevice(path)
+            capabilities = device.capabilities()
+            if ecodes.EV_KEY in capabilities:
+                keys = capabilities[ecodes.EV_KEY]
+                # Pode ser lista de ints ou lista de tuplas (int, any)
+                if isinstance(keys[0], tuple):
+                    keys = [code for code, _ in keys]
+                if ecodes.KEY_A in keys:
+                    return path
+        except Exception as e:
+            continue  # ignora dispositivos problemáticos
+    return None
+
+
+def monitor_keyboard(input_device_path, led_device):
+    """Monitora eventos de LED e reativa Scroll Lock caso desligado."""
+    try:
+        device = InputDevice(input_device_path)
+        print(f"✅ Monitorando: {device.name} ({input_device_path})")
+        for event in device.read_loop():
+            if event.type == ecodes.EV_LED:
+                if get_scrolllock_state(led_device) == 0:
+                    set_scrolllock(led_device, 1)
+    except Exception as e:
+        print(f"[Erro] ao ler o teclado: {e}")
+        print("⏳ Aguardando reconexão do teclado...")
+
+
+def handle_udev_events(led_device):
+    """Observa eventos do udev para reconectar automaticamente."""
+    context = pyudev.Context()
+    monitor = pyudev.Monitor.from_netlink(context)
+    monitor.filter_by('input')
+    observer = pyudev.MonitorObserver(monitor, callback=lambda action, device: on_device_event(action, device, led_device))
+    observer.start()
+
+
+def on_device_event(action, device, led_device):
+    if action == "add" and 'event' in device.device_node:
+        print("🔌 Novo dispositivo conectado. Reanalisando teclado...")
+        time.sleep(1)
+        new_device = find_keyboard_device()
+        if new_device:
+            threading.Thread(target=monitor_keyboard, args=(new_device, led_device), daemon=True).start()
+
 
 def main():
-    try:
-        device = evdev.InputDevice(DEVICE_PATH)
-        print(f"🔍 Monitorando teclado: {device.name} ({DEVICE_PATH})")
+    led_device = find_scrolllock_led()
+    if not led_device:
+        print("❌ Nenhum Scroll Lock LED encontrado.")
+        return
 
-        # Garante que Scroll Lock começa aceso
-        if get_scrolllock_state() == 0:
-            turn_on_scroll_lock()
+    input_device_path = find_keyboard_device()
+    if not input_device_path:
+        print("❌ Nenhum teclado encontrado.")
+        return
 
-        # Loop para monitorar eventos EV_LED e garantir Scroll Lock ligado
-        for event in device.read_loop():
-            if event.type == evdev.ecodes.EV_LED:
-                if get_scrolllock_state() == 0:
-                    turn_on_scroll_lock()
+    # Garante LED ligado no início
+    set_scrolllock(led_device, 1)
 
-    except PermissionError:
-        print("❌ Permissão negada. Use sudo ou adicione o usuário ao grupo 'input'.")
-    except FileNotFoundError:
-        print("❌ Dispositivo não encontrado. Verifique o caminho.")
-    except KeyboardInterrupt:
-        print("\n✅ Encerrado pelo usuário.")
+    # Inicia heartbeat
+    threading.Thread(target=blink_led, args=(led_device,), daemon=True).start()
+
+    # Inicia monitoramento de reconexão
+    handle_udev_events(led_device)
+
+    # Inicia monitoramento principal
+    monitor_keyboard(input_device_path, led_device)
+
 
 if __name__ == "__main__":
     main()
+
 ```
 
 Dê permissão de execução:
